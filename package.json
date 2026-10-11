@@ -1,0 +1,98 @@
+'use strict';
+
+const express = require('express');
+const { Pool } = require('pg');
+
+// Toda a configuração vem de variáveis de ambiente. Nada sensível no código.
+const required = ['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD'];
+const missing = required.filter((name) => !process.env[name]);
+if (missing.length > 0) {
+  console.error(`Variáveis de ambiente ausentes: ${missing.join(', ')}`);
+  process.exit(1);
+}
+
+const PORT = Number(process.env.PORT || 3000);
+
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 5432),
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  max: 10,
+  connectionTimeoutMillis: 5000,
+});
+
+const app = express();
+app.use(express.json());
+
+app.get('/', (_req, res) => {
+  res.json({
+    app: 'tasks-api',
+    endpoints: ['GET /health', 'GET /tasks', 'POST /tasks', 'DELETE /tasks/:id'],
+  });
+});
+
+// Testa a conexão com o banco e mostra com qual usuário a aplicação está conectada.
+app.get('/health', async (_req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT current_user AS db_user, now() AS db_time');
+    res.json({ status: 'ok', ...rows[0] });
+  } catch (err) {
+    console.error('Falha no health check:', err.message);
+    res.status(503).json({ status: 'erro', message: 'banco indisponível' });
+  }
+});
+
+app.get('/tasks', async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT id, title, done, created_at FROM tasks ORDER BY id');
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/tasks', async (req, res, next) => {
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  if (!title) {
+    return res.status(400).json({ error: 'o campo "title" é obrigatório' });
+  }
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO tasks (title) VALUES ($1) RETURNING id, title, done, created_at',
+      [title]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/tasks/:id', async (req, res, next) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'id inválido' });
+  }
+  try {
+    const result = await pool.query('DELETE FROM tasks WHERE id = $1', [id]);
+    res.status(result.rowCount ? 204 : 404).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  console.error(err.message);
+  res.status(500).json({ error: 'erro interno' });
+});
+
+const server = app.listen(PORT, () => console.log(`tasks-api ouvindo na porta ${PORT}`));
+
+function shutdown(signal) {
+  console.log(`${signal} recebido, encerrando...`);
+  server.close(() => pool.end().then(() => process.exit(0)));
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

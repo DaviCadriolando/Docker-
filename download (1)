@@ -1,0 +1,166 @@
+# Desafio Docker: ambiente multi-container com Docker Compose
+
+Ambiente com **dois serviços**: uma API de tarefas em **Node.js** e um banco **PostgreSQL**, orquestrados com Docker Compose. O projeto usa Dockerfile multi-stage com imagens Alpine, volume para persistência, rede customizada e variáveis de ambiente para tudo que é sensível.
+
+## Estrutura
+
+```text
+.
+├── app/
+│   ├── Dockerfile          # build multi-stage (node:20-alpine), roda sem root
+│   ├── .dockerignore
+│   ├── package.json
+│   ├── package-lock.json
+│   └── src/server.js       # API (Express + pg), configurada só por variáveis de ambiente
+├── db/
+│   └── init/01-init.sh     # cria o usuário da aplicação e as tabelas (1ª inicialização)
+├── scripts/
+│   └── gerar-env.sh        # gera o .env com senhas aleatórias
+├── docker-compose.yml
+├── .env.example            # modelo das variáveis (sem segredos reais)
+└── .gitignore              # garante que o .env nunca vai para o GitHub
+```
+
+## Como cada requisito foi atendido
+
+| Requisito | Como foi feito |
+| --- | --- |
+| Dockerfile com multi-stage e Alpine | `app/Dockerfile`: estágio `deps` instala só as dependências de produção; estágio `runtime` copia o resultado. Ambos em `node:20-alpine`, execução com o usuário `node` (sem root) e `HEALTHCHECK` |
+| Docker Compose com 2 serviços | `app` (API) e `db` (`postgres:16-alpine`) |
+| Volumes para persistência | Volume nomeado `tasks-pgdata` montado em `/var/lib/postgresql/data` |
+| Rede customizada | Rede bridge `tasks-backend`; os containers se encontram pelo nome do serviço (`db`) |
+| Variáveis de ambiente | Tudo vem do arquivo `.env` (não versionado). O Compose exige as variáveis obrigatórias (`${VAR:?}`) e falha com mensagem clara se faltar alguma |
+| Banco sem usar só o root | `db/init/01-init.sh` cria `APP_DB_USER` sem superuser, sem criar banco/roles e sem DDL: só `SELECT/INSERT/UPDATE/DELETE` nas tabelas |
+| Sem valores sensíveis no código | Nenhuma senha, host ou usuário no código nem nos arquivos versionados; só o `.env.example` com valores de exemplo |
+
+Outros cuidados de segurança: o banco **não publica porta no host** (só a API é acessível de fora) e a API só sobe depois que o banco passa no `healthcheck` (`depends_on` com `service_healthy`).
+
+## Pré-requisitos
+
+- Docker e Docker Compose v2 (`docker compose version`)
+- `openssl` (apenas se for usar o script `gerar-env.sh`)
+
+## Passo a passo
+
+### 1. Clonar o repositório
+
+```bash
+git clone https://github.com/<seu-usuario>/<seu-repositorio>.git
+cd <seu-repositorio>
+```
+
+### 2. Configurar as variáveis de ambiente
+
+Opção A (recomendada): gerar o `.env` com senhas aleatórias.
+
+```bash
+./scripts/gerar-env.sh
+```
+
+Opção B: copiar o modelo e editar à mão.
+
+```bash
+cp .env.example .env
+nano .env   # troque as senhas
+```
+
+| Variável | Para que serve |
+| --- | --- |
+| `POSTGRES_DB` | Nome do banco criado na inicialização |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | Usuário administrador do banco (usado só para inicializar) |
+| `APP_DB_USER` / `APP_DB_PASSWORD` | Usuário de permissões limitadas que a aplicação usa |
+| `APP_PORT` | Porta da API no host (padrão 3000) |
+
+### 3. Subir os containers
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+Os dois serviços devem aparecer como `healthy`/`running`. Para acompanhar os logs:
+
+```bash
+docker compose logs -f
+```
+
+## Testando
+
+### Conexão entre os containers
+
+```bash
+curl http://localhost:3000/health
+```
+
+Resposta esperada: `status: ok` e `db_user` igual ao valor de `APP_DB_USER`, o que confirma que a API fala com o banco **pelo usuário limitado**, e não pelo administrador.
+
+### Usando a API
+
+```bash
+# criar uma tarefa
+curl -X POST http://localhost:3000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Estudar Docker Compose"}'
+
+# listar
+curl http://localhost:3000/tasks
+
+# apagar (troque 1 pelo id)
+curl -X DELETE http://localhost:3000/tasks/1
+```
+
+### Persistência dos dados
+
+```bash
+curl -X POST http://localhost:3000/tasks -H "Content-Type: application/json" -d '{"title":"Persistir dados"}'
+
+docker compose down          # remove os containers, mas mantém o volume
+docker compose up -d
+
+curl http://localhost:3000/tasks   # a tarefa continua lá
+```
+
+### Segurança do banco
+
+O usuário da aplicação não consegue alterar a estrutura do banco:
+
+```bash
+set -a; . ./.env; set +a
+docker compose exec db psql -U "$APP_DB_USER" -d "$POSTGRES_DB" -c "DROP TABLE tasks;"
+# ERROR:  must be owner of table tasks
+
+docker compose exec db psql -U "$APP_DB_USER" -d "$POSTGRES_DB" -c "CREATE TABLE x (id int);"
+# ERROR:  permission denied for schema public
+```
+
+Confirmar que o banco não está exposto no host (a coluna de portas do `db` deve estar vazia):
+
+```bash
+docker compose ps
+```
+
+Conferir a rede e o volume:
+
+```bash
+docker network inspect tasks-backend
+docker volume inspect tasks-pgdata
+```
+
+## Observações importantes
+
+- O script `db/init/01-init.sh` roda **só na primeira inicialização**, quando o volume está vazio. Se você mudar `APP_DB_USER` ou `APP_DB_PASSWORD` depois, o banco existente **não** é alterado. Para recomeçar do zero (apaga todos os dados):
+
+  ```bash
+  docker compose down -v
+  docker compose up -d --build
+  ```
+
+- Nunca faça commit do `.env`. O `.gitignore` já o ignora.
+- Em produção, a mesma estratégia pode ser trocada por Docker secrets ou HashiCorp Vault sem mudar o código da aplicação, já que ele só lê variáveis de ambiente.
+
+## Parar e limpar
+
+```bash
+docker compose down        # para e remove containers e rede (mantém dados)
+docker compose down -v     # também apaga o volume com os dados
+```
